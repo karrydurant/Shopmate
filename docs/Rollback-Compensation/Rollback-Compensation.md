@@ -1,6 +1,6 @@
 # 事务回滚补偿
 
-## CouponService.java
+## [CouponService.java](detail/CouponService.md)
 
 整个领券流程：幂等判断-->Redis 预扣-->注册事务回调-->DB 乐观锁扣减-->发放
 
