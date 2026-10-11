@@ -55,7 +55,7 @@ flowchart TB
     style Neg2 fill:#ffccbc,stroke:#d84315
 ```
 
-## ProductDetailService.java
+## [ProductDetailService.java](detail/ProductDetailService.md)
 
 ## ProductIdBloomFilter.java
 
