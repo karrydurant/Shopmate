@@ -1,6 +1,6 @@
 # 记忆系统
 
-```mermiad
+```mermaid
 flowchart TB
     subgraph 对外门面层
         STM[short_term.py<br/>短期记忆门面]
