@@ -30,8 +30,40 @@ import java.util.stream.Collectors;
 @Slf4j
 @Service
 @RequiredArgsConstructor
-
 public class ProductDetailService {
+
+    private final ProductSpuMapper spuMapper;          // L4 查 SPU
+    private final ProductSkuMapper skuMapper;          // L4 查 SKU
+    private final StringRedisTemplate redisTemplate;  // L2 Redis
+    private final RedissonClient redissonClient;       // 分布式锁
+    private final ProductIdBloomFilter bloom;          // L3 布隆
+
+    // 负缓存存活秒数，默认60s。为什么短，因为商品随时可能被新建出来
+    @Value("${shopmate.product.negative-cache-seconds:60}")
+    private long negativeCacheSeconds;
+
+    // 抢分布式锁最多等多久，默认1s。等不起，等不到就降级直读 DB
+    @Value("${shopmate.product.lock-wait-ms:1000}")
+    private long lockWaitMs;
+
+    // 锁持有上限，默认 10 s，必须显式给，不然 Redisson 看门狗会一直续期，
+    // 万一某条路径漏了 unlock，这个商品就被永久锁死。
+    @Value("${shopmate.product.lock-lease-ms:10000}")
+    private long lockLeaseMs;
+
+    // L1--Caffeine 本地缓存实例
+    // 每个 JVM 进程一份，存在堆内存中
+    private final Cache<Long, ProductDetailVO> localCache=Caffeine.newBuilder()
+            .maximumSize(5_000)
+            .expireAfterWrite(30, TimeUnit.SECONDS)    // 写后 30 秒过期——本实例最多容忍 30 秒旧数据
+            .recordStats()                            // 开命中率统计，方便后面调参
+            .build();
+
+    // 本地缓存哨兵：一个空 VO 对象
+    // 用 static final 保证全 JVM 只有一个实例，下面可以用 == 引用比较。
+    // 语义：Caffeine 里存它代表"这个 id 查过了，DB 里真没有"。
+    static final ProductDetailVO NULL_MARKER=new ProductDetailVO();
+
     public ProductDetailVO getProductDetail(Long productId) {
         // 第一步：查L1本地缓存
         ProductDetailVO local=localCache.getIfPresent(productId);
@@ -97,6 +129,8 @@ public class ProductDetailService {
         return CacheConstants.PRODUCT_DETAIL + productId;
     }
     //从 Redis 读商品详情，命中就回填 L1
-    
+    private ProductDetailVO readRedis(Long productId) {
+        String json=redisTemplate.opsForValue().get(keyOf())
+    }
 }
 ```
