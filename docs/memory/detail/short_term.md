@@ -34,6 +34,51 @@ class ChatRound:
 
 class ShortTermMemory:
     """短期记忆管理器"""
+
+    def __init__(self):
+        self.client = redis.from_url(settings.redis_url, decode_responses=True)
+
+    # 写入
+    def append_round(self, session_id: str, round_data: ChatRound):
+        """追加一轮对话"""
+        key=SESSION_PREFIX+session_id
+        try:
+            self.client.rpush(key, json.dumps(round_data.to_dict(), ensure_ascii=False))
+            self._maybe_trim(session_id, key)
+            self.client.expire(key, settings.session_ttl_seconds)
+        except redis.RedisError as e:
+            logger.warning("[ShortTermMemory] Redis 不可用，本轮不落短期记忆 | session=%s | %s",
+                           session_id, e)
+    def _maybe_trim(self, session_id: str, key: str):
+        """超出窗口上限时，将最早几轮压缩为摘要"""
+        size=self.client.llen(key)
+        if not size or size<=settings.max_session_rounds:
+            return
+        # 取出最旧的 round_to_compress 轮
+        round_to_compress = 5
+        old_rounds = []
+        for _ in range(round_to_compress):
+            raw = self.client.lpop(key)
+            if raw:
+                old_rounds.append(ChatRound.from_dict(json.loads(raw)))
+
+        # 压缩为摘要（调用 LLM 做单句总结）
+        summary = self._compress_rounds(old_rounds)
+
+        # 存入摘要
+        summary_key = SUMMARY_PREFIX + session_id
+        existing = self.client.hget(summary_key, "summary") or ""
+        merged = (existing + " " + summary).strip()
+        self.client.hset(summary_key, "summary", self._cap_summary(merged))
+        self.client.expire(summary_key, settings.session_ttl_seconds)
+
+        logger.info("[ShortTermMemory] compressed %d rounds | session=%s | summary=%s",
+                    round_to_compress, session_id, summary[:80])
+
+    def _cap_summary(self, summary: str)->str:
+        """把摘要压到字符上限内"""
+        limit=settings.memory_summary_max_chars
+        if len()
 ```
 
 ## 定位
