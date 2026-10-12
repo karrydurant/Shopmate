@@ -63,19 +63,4 @@ flowchart TB
 
 ## [short_term.py](detail/short_term.md) -- 短期记忆门面
 
-职责：
-
-1.每轮对话追加到 Redis List(agent:session:{id})
-
-2.对话超过 20 轮时自动把最旧的 5 轮压缩成摘要，存进 Redis Hash
-
-3.提供 get_history() / get_summary() 给 Agent 拼 prompt 用
-
-## long_term.py -- 长期记忆门面
-
-用户长期偏好的读写入口，写入时做冲突消解，召回时做排序。
-
-职责：
-
-1.对外 API：save_memory()/save_memories_from_conversation()/recall_memories()
-
+## [long_term.py](detail/long_term.md) -- 长期记忆门面
