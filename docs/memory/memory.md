@@ -61,7 +61,7 @@ flowchart TB
     EVAL -->|调用同一套接口| STORE
 ```
 
-## short_term.py -- 短期记忆门面
+## [short_term.py](detail/short_term.md) -- 短期记忆门面
 
 职责：
 
