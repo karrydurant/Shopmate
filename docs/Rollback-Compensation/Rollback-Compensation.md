@@ -6,4 +6,22 @@
 
 ## CouponMapper.java
 
-乐观锁 SQL：UPDATE ... WHERE version = #{version}
+```java
+package com.shopmate.coupon.repository;
+
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.shopmate.coupon.model.entity.Coupon;
+import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Update;
+
+@Mapper
+public interface CouponMapper extends BaseMapper<Coupon> {
+    @Update("UPDATE coupon SET remaining_count = remaining_count - 1, version = version + 1 " +
+            "WHERE coupon_code = #{couponCode} AND remaining_count > 0 AND version = #{version}")
+    int decrementRemainingCount(@Param("couponCode") String couponCode, @Param("version") int version);
+    @Update("UPDATE coupon SET remaining_count = remaining_count + 1, version = version + 1 " +
+            "WHERE coupon_code = #{couponCode} AND version = #{version}")
+    int incrementRemainingCount(@Param("couponCode") String couponCode, @Param("version") int version);
+}
+```
