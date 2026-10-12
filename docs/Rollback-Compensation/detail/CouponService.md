@@ -72,7 +72,11 @@ public class CouponService {
         String stockKey=STOCK_KEY_PREFIX+couponCode;
         // DECR 原子减一，返回减后的值
         Long remain=redisTemplate.opsForValue().decrement(stockKey);
-        // 减成负数
+        // 减成负数=超卖了
+        if (remain==null || remain<0) {
+            redisTemplate.opsForValue().increment(stockKey);
+            throw BizException.conflict("优惠券已抢光");
+        }
     }
 }
 
