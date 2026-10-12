@@ -5,6 +5,7 @@ package com.shopmate.order.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.shopmate.common.exception.BizException;
+import com.shopmate.coupon.service.CouponService;
 import com.shopmate.order.model.entity.Order;
 import com.shopmate.order.model.entity.OrderItem;
 import com.shopmate.order.model.enums.OrderStatus;
@@ -35,6 +36,7 @@ public class OrderService {
     private final ProductSkuMapper skuMapper;
     // Redis 存下单幂等键
     private final StringRedisTemplate redisTemplate;
+    private final CouponService couponService;
 
     // 无 requestId 的重载入口
     public Order createOrder(Order order, List<OrderItem> items) {
@@ -91,7 +93,12 @@ public class OrderService {
         }
         // 把算好的总额塞回订单主表
         order.setTotalAmount(total);
-        order.setPayAmount(total);
+        // 用券抵扣。校验（门槛/有效期/类型/归属）与核销都在 applyToOrder 里完成
+        // 任何一条不满足即抛异常 —— 于是这一步失败时下面还没开始，事务回滚也没有半成品。
+        BigDecimal discount = couponService.applyToOrder(
+                order.getUserId(), order.getCouponCode(), total, order.getOrderNo());
+        order.setDiscountAmount(discount);
+        order.setPayAmount(total.subtract(discount));
 
         // 第四步：由应用写 create_time，不用 DB 默认值
         order.setCreateTime(LocalDateTime.now());
@@ -245,8 +252,43 @@ public class OrderService {
             int affected = skuMapper.releaseStock(item.getSkuId(), item.getQuantity());
             // 这里和支付侧的处理不一样——只记 warn，不抛异常
             // 原因：如果重复归还，affected=0 说明锁已经不在账上了，这是无害空操作
-            // 
+            if (affected == 0) {
+                // 与支付侧的扣减失败处理相反：这里只记 warn，不抛。
+                // 成因只有一个 —— 这批锁定库存已不在账上（被重复归还）。而 releaseStock 的
+                // `WHERE locked_stock >= n` 让重复归还本身是无害的空操作：既不会把
+                // locked_stock 减成负数，也不会虚增可售。既然抛异常只会让订单永远取消不掉、
+                // 每个扫描周期重试一次并永久报错，那就显式留痕而不是制造一个死循环。
+                log.warn("[Order] release affected 0 rows | orderNo={} | skuId={} | qty={}",
+                        orderNo, item.getSkuId(), item.getQuantity());
+            }
         }
+
+        Order cancelled = getByOrderNo(orderNo);
+        log.info("[Order] cancelled | orderNo={} | locked stock returned", orderNo);
+        return cancelled;
+    }
+
+    // 退款 -- 状态机流转+退券，不碰资金，不碰库存
+    @Transactional(rollbackFor = Exception.class)
+    public Order refundOrder(String orderNo) {
+        Order order = getByOrderNo(orderNo);
+
+        // 先裁决：只有「已支付/已发货 -> 退款中」能过，并发下唯一
+        transition(order.getId(), OrderStatus.REFUNDING);
+        transition(order.getId(), OrderStatus.REFUNDED);
+
+        // 退券：两次 CAS 都赢了才走到这里，所以并发退款只有一个会真的退券
+        couponService.returnForOrder(order.getCouponCode(), orderNo);
+
+        Order refunded = getByOrderNo(orderNo);
+        log.info("[Order] refunded | orderNo={} | amount={} | status-only, no money/inventory move",
+                orderNo, refunded.getPayAmount());
+        return refunded;
+    }
+
+    private List<OrderItem> orderItemsOf(Long orderId) {
+        return orderItemMapper.selectList(
+                new LambdaQueryWrapper<OrderItem>().eq(OrderItem::getOrderId, orderId));
     }
 }
 ```
