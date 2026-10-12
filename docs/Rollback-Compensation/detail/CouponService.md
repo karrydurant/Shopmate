@@ -26,12 +26,22 @@ import java.util.concurrent.TimeUnit;
 @Service
 @RequiredArgsConstructor
 public class CouponService {
+    
+    // 操作 coupon 表（库存权威源）
+    private final CouponMapper couponMapper;
+    // 操作 user_coupon 表（一人一单记录）
+    private final UserCouponMapper userCouponMapper;
+    // Redis，扛高并发预扣
+    private final StringRedisTemplate redisTemplate;
+    // 库存 key 前缀，完整 key = 前缀 + 券码
+    private static final String STOCK_KEY_PREFIX = "coupon:stock:";
+
+    //
     @Transactional(rollbackFor=Exception.class)
-    // 领券主入口：成功true，失败抛 BizException
+    // 领券主入口：成功 true，失败抛 BizException
     public boolean acquireCoupon(String userId, String couponCode) {
         // 第0步：业务幂等，先查这用户是不是已经领过
         Long already=userCouponMapper.selectCount(
-                // WHERE user_id=? AND coupon_code=?
                 new LambdaQueryWrapper<UserCoupon>()
                         .eq(UserCoupon::getUserId, userId)
                         .eq(UserCoupon::getCouponCode, couponCode));
@@ -59,7 +69,7 @@ public class CouponService {
         if (coupon==null || coupon.getRemainingCount() <= 0) {
             throw BizException.notFound("优惠券不存在或已过期");
         } 
-        // 有结束时间 且 已过
+        // 有结束时间且已过期
         if (coupon.getEndTime()!=null && coupon.getEndTime().isBefore(LocalDateTime.now())) {
             throw BizException.badParam("优惠券已过期");
         }
@@ -74,9 +84,37 @@ public class CouponService {
         Long remain=redisTemplate.opsForValue().decrement(stockKey);
         // 减成负数=超卖了
         if (remain==null || remain<0) {
+            // 反悔：把减的加回去
             redisTemplate.opsForValue().increment(stockKey);
             throw BizException.conflict("优惠券已抢光");
         }
+
+        // 第4步：注册回滚钩子，后面 DB 失败回滚时补回 Redis
+        // 把回调绑定到当前事务
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            // 事务结束（提交/回滚）都会调
+            @Override
+            public void afterCompletion(int status) {
+                // 只有被回滚才补偿（提交是 STATUS_COMMITTED）
+                if (status == STATUS_ROLLED_BACK) {
+                    // 抵消第 3 步那次 decrement
+                    redisTemplate.opsForValue().increment(stockKey);
+                    // 释放幂等键，让用户能重试
+                    redisTemplate.delete(idemKey);
+                    log.warn("[Coupon] rollback — Redis stock restored | code={}", couponCode);
+                }
+            }
+        });
+        // 第5步：DB 乐观锁最终裁决，复用第一步读到的 version
+        int affected=couponMapper.decrementRemainingCount(couponCode, coupon.getVersion());
+        if (affected==0) {
+            throw BizException.conflict("优惠券库存不足，请稍后再试");
+        }
+        // 第6步：写领取记录
+        // INSERT 一条
+        userCouponMapper.issueToUser(userId, couponCode);
+        log.info("[Coupon] acquired | userId={} | code={}", userId, couponCode);
+        return true;
     }
 }
 
