@@ -95,6 +95,7 @@ public class ProductDetailService {
             locked=lock.tryLock(lockWaitMs, lockLeaseMs, TimeUnit.MILLISECONDS);
             if (!locked) {
                 // 抢不到锁 = 有人在回源，不是商品不存在。降级直读 DB，不写缓存
+                // 有人在回源：已经有一个请求抢先拿到这把 productId 的锁，正在执行 "查 DB、回填缓存"
                 log.warn("[ProductDetail] lock busy, degrading to direct DB read | productId={}", productId);
                 return loadFromDB(productId, false);
             }
@@ -109,9 +110,37 @@ public class ProductDetailService {
             }
             return loadFromDB(productId, true);
         } catch (InterruptedException e) {
-            
+            Thread.currentThread().interrupt();
+            // 中断同样不该渲染成「不存在」
+            return loadFromDB(productId, false);
+        } finally {
+            // 用持有者判定
+            if (locked && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
     }
+
+    private static String keyOf(Long productId) {
+        return CacheConstants.PRODUCT_DETAIL + productId;
+    }
+
+    /**
+     * 读 L2 并回填 L1
+     *
+     * 回填用的是调用方请求的那个 productId，不是反序列化出来的。
+     */
+    private ProductDetailVO readRedis(Long productId) {
+        String json=redisTemplate.opsForValue().get(keyOf(productId));
+        if (json==null || CacheConstants.PRODUCT_DETAIL_NULL.equals(json)) {
+            return null;
+        }
+        ProductDetailVO vo=JSON.parseObject(json, ProductDetailVO.class);
+        localCache.put(productId, vo);
+        return vo;
+    }
+
+    // 
 }
 ```
 
