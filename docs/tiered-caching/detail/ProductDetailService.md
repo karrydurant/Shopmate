@@ -140,33 +140,81 @@ public class ProductDetailService {
         return vo;
     }
 
-    // 
+    // L2里存的是不是负缓存哨兵，是的话顺手回填 L1
+    private boolean isNegativeCached(Long productId) {
+        String json = redisTemplate.opsForValue().get(keyOf(productId));
+        if (CacheConstants.PRODUCT_DETAIL_NULL.equals(json)) {
+            localCache.put(productId, NULL_MARKER);
+            return true;
+        }
+        return false;
+    }
+
+    // 写入负缓存：本地+Redis各一份
+    private void cacheNegative(Long productId) {
+        localCache.put(productId, NULL_MARKER);
+        redisTemplate.opsForValue().set(keyOf(productId), CacheConstants.PRODUCT_DETAIL_NULL,
+                negativeCacheSeconds, TimeUnit.SECONDS);
+    }
+
+    // 抢锁失败/被中断的降级路径传 false —— 那一次读是「尽力而为」，不该污染缓存
+    private ProductDetailVO loadFromDB(Long productId, boolean writeCache) {
+         ProductSpu spu = spuMapper.selectById(productId);
+         if (spu == null) {
+             if (writeCache) {
+                 cacheNegative(productId);
+             }
+             return null;
+        }
+
+        List<ProductSku> skus = skuMapper.selectBySpuId(productId);
+        List<ProductDetailVO.SkuItem> skuItems = skus.stream()
+                .map(s -> ProductDetailVO.SkuItem.builder()
+                        .id(s.getId()).title(s.getTitle())
+                        .price(s.getPrice()).originalPrice(s.getOriginalPrice())
+                        .stock(s.getStock()).image(s.getImage())
+                        .attributes(s.getAttributes()).build())
+                .collect(Collectors.toList());
+
+        BigDecimal minPrice = skus.stream().map(ProductSku::getPrice)
+                .min(Comparator.naturalOrder()).orElse(BigDecimal.ZERO);
+        BigDecimal maxPrice = skus.stream().map(ProductSku::getPrice)
+                .max(Comparator.naturalOrder()).orElse(BigDecimal.ZERO);
+
+        ProductDetailVO vo = ProductDetailVO.builder()
+                .id(spu.getId()).title(spu.getTitle())
+                .categoryId(spu.getCategoryId()).description(spu.getDescription())
+                .mainImage(spu.getMainImage()).status(spu.getStatus())
+                .minPrice(minPrice).maxPrice(maxPrice)
+                .totalSaleCount(skus.stream().mapToInt(ProductSku::getSaleCount).sum())
+                .skus(skuItems).build();
+
+        if (writeCache) {
+            long ttl = CacheConstants.PRODUCT_DETAIL_TTL + ThreadLocalRandom.current().nextLong(600);
+            redisTemplate.opsForValue().set(keyOf(productId), JSON.toJSONString(vo), ttl, TimeUnit.SECONDS);
+            localCache.put(productId, vo);
+            // 从 DB 学到「这个 id 存在」，立刻补进布隆（兜住刷新窗口内的新商品）
+            bloom.markPresent(productId);
+            log.info("[ProductDetail] loaded from DB | productId={} | skus={}", productId, skus.size());
+        }
+        return vo;
+
+        // 失效两级缓存
+        public void invalidateCache(Long productId) {
+            redisTemplate.delete(keyOf(productId));
+            localCache.invalidate(productId);
+            log.info("[ProductDetail] cache invalidated | productId={}", productId);
+        }
+
+        // 商品新增或更新后调用
+        public void onProductUpserted(Long productId) {
+            invalidateCache(productId);
+            bloom.markPresent(productId);
+        }
+        // 商品软删后调用
+        public void onProductDeleted(Long productId) {
+            invalidateCache(productId);
+        }
+    }
 }
 ```
-
-## 缓存穿透 -- 一直查不存在的 id
-
-使用布隆过滤器+负缓存可以解决：布隆启动时把库里所有存在的id用一组哈希塞进一个巨大的位图。它有个性质 -- 说 "不存在" 一定对，说 "存在" 可能错，一些错误 id 可能会被误判为 "存在"。
-
-为什么还要配负缓存：布隆那 1% 误判会把假 id 放进来到 DB，DB 返回 null。这时把 "这 id 不存在" 写个 60 秒短 TTL 的缓存，下次同一个假 id 再来，直接认不存在 —— 补上布隆漏过来的那一小撮。负缓存 TTL 故意短，是因为商品随时可能被新建出来，否定不能存太久。
-
-## 缓存击穿 -- 热点 key 过期那一瞬间被打爆
-
-使用分布式锁+Double-Check 能挡：拿到锁的那个线程去回源DB、回填缓存，其它线程在门口等。等锁的过程中第一个线程已经把 Redis 写好了，所以它们拿到锁后 Double-Check 一次 Redis，发现已经有了，直接返回 -- DB 那一刻只被打一次
-
-抢不到锁不返回 null：这里有个反直觉的设计。抢不到锁 = 别人正在回源，不是商品不存在。如果这时返回 null，前端会渲染成 "404 商品消失了"—— 一次正常的锁竞争被误报成事故。所以代码里降级为直接读一次 DB（多读一次而已，代价远小于误报 404），而且这次不写缓存，免得在没拿到锁的时候抢先回填、破坏锁要保护的那个互斥。
-
-## 缓存雪崩 -- 一批 key 同时过期
-
-使用TTL+随机抖动：过期时间=1小时 + random (0, 600 秒)。本来 "同一秒挂掉 5000 个 key" 被摊成 "接下来 10 分钟陆续挂"，DB 的瞬时尖峰被时间维度摊平了。
-
-## 缓存一致性 -- 脏读
-
-改了 DB 后缓存还是旧值，用户看到旧价格 / 旧库存。
-
-解决办法是先改 DB、事务提交后再删缓存，而且本实例自己删、其他实例靠 RocketMQ 广播删。为什么是 "先改库再删缓存" 而不是反过来 —— 如果先删缓存再改库，中间插进来一个读请求会把旧值重新写回缓存，那删了等于没删。
-
-## 防止错误释放别人的锁 
-
-解锁前用 isHeldByCurrentThread() 判断，不然 finally 里无脑 unlock 会解掉别人刚拿到的锁。
-
