@@ -147,3 +147,14 @@ def get_summary(self, session_id: str) -> str:
         return ""
     return summary if summary else ""
 ```
+
+## 长期记忆
+
+跨会话记住 "这个用户是谁、喜欢什么"
+
+职责：
+
+1.写入——每轮对话做一次 "记忆整理"
+
+2.召回——下一轮对话开头把相关记忆捞出来
+
