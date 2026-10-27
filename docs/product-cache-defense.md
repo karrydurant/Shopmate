@@ -207,8 +207,110 @@ public class ProductDetailService {
 }
 ```
 
+## 写路径
+
+### 商品增删改——ProductWriteService
+
+#### updateSkus
+
+不是 "全删再全插" 的普通更新，而是按 id 就地更新
+
+```java
+private void updateSkus(Long productId, List<ProductSaveRequest.SkuItem> items) {
+    // 把这个商品现在有哪些 SKU 查出来
+    List<ProductSku> oldSkus = skuMapper.selectBySpuId(productId);
+    Map<Long, ProductSku> oldById = oldSkus.stream()
+            .collect(Collectors.toMap(ProductSku::getId, Function.identity()));
+
+    // 如果请求里同一个 id 出现了两次，直接报错
+    Set<Long> requestedIds = new HashSet<>();
+    for (ProductSaveRequest.SkuItem item : items) {
+        if (item.getId() != null && !requestedIds.add(item.getId())) {
+            throw BizException.badParam("SKU id 重复: " + item.getId());
+        }
+    }
+
+    // 哪些 SKU 要被删掉
+    // 比如原来有 3 个 SKU（id 1/2/3），这次请求只带了 1/2，那 id=3 就是被去掉的
+    List<Long> removedIds = oldSkus.stream()
+            .map(ProductSku::getId)
+            .filter(id -> !requestedIds.contains(id))
+            .collect(Collectors.toList());
+
+    // 要删的 SKU 如果有进行中订单——拒绝
+    if (!removedIds.isEmpty() && hasActiveOrders(productId)) {
+        // 进行中的订单还要靠这些 SKU 行去扣/还锁定库存；删掉它们之后，
+        // 支付或入库回补会更新 0 行、静默丢库存（订单写审计时也只记 warn）。
+        throw BizException.conflict("该商品存在进行中的订单，不能删除 SKU");
+    }
+
+    for (ProductSaveRequest.SkuItem item : items) {
+        if (item.getId() == null) {
+            insertSku(productId, item);  // id 为空 = 新增 SKU
+            continue;
+        }
+
+        // id 有值 = 更新现有 SKU
+        ProductSku old = oldById.get(item.getId());
+        if (old == null) {
+            throw BizException.badParam("SKU 不属于该商品: " + item.getId());
+        }
+        // 库存不能小于已锁定库存
+        int locked = old.getLockedStock() == null ? 0 : old.getLockedStock();
+        if (item.getStock() != null && item.getStock() < locked) {
+            throw BizException.badParam(
+                    "SKU " + item.getId() + " 的库存不能小于已锁定库存 " + locked);
+        }
+        ProductSku update = new ProductSku();
+        update.setId(item.getId());
+        update.setTitle(item.getTitle());
+        update.setPrice(item.getPrice());
+        update.setOriginalPrice(item.getOriginalPrice());
+        update.setStock(item.getStock());
+        update.setImage(item.getImage());
+        update.setAttributes(item.getAttributes());
+        // 只更新请求给出的列：lockedStock / saleCount 由服务端维护，这里一个字都不写。
+        if (hasSkuChanges(update)) {
+            skuMapper.updateById(update);
+        }
+    }
+
+    // 删 SKU
+    if (!removedIds.isEmpty()) {
+        skuMapper.deleteBatchIds(removedIds);
+    }
+}
+```
+
+为什么不是 "全删再全插"
+
+因为如果整批删除，有未支付/未完成订单时，已锁定的库存会从账上凭空消失，而后续支付 / 取消还要按订单明细去扣或还这一份 —— 库存对不上账；销量也会被重置为 0。
+
+#### 缓存失效时机——invalidateAfterCommit
+
+```java
+private void invalidateAfterCommit(String op, Long productId) {
+    if (TransactionSynchronizationManager.isSynchronizationActive()) {
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                invalidateLocally(op, productId);
+                notifier.publish(op, productId);
+            }
+        });
+    } else {
+        invalidateLocally(op, productId);
+        notifier.publish(op, productId);
+    }
+}
+```
+
 ## 广播（多实例缓存同步）
 
 ### MQ 生产者——ProductCacheNotifier
 
+
+
 ### MQ 消费者——CacheInvalidationConsumer
+
+
