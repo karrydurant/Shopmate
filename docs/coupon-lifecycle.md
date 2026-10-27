@@ -6,6 +6,14 @@
 
 用户点领取时走这个方法
 
+Redis 预扣 + DB 乐观锁：
+
+Redis 先挡掉大部分请求（快）；
+
+到 DB 的并发已经很少了，乐观锁够用（准）；
+
+两边不一致时，后台对账任务修回来（兜底）。
+
 ```java
 @Transactional(rollbackFor = Exception.class)
 public boolean acquireCoupon(String userId, String couponCode) {
@@ -42,12 +50,14 @@ public boolean acquireCoupon(String userId, String couponCode) {
     // Redis 预扣库存
     String stockKey = STOCK_KEY_PREFIX + couponCode;
     Long remain = redisTemplate.opsForValue().decrement(stockKey);
+    // 如果减完变成负数，说明库存不够 —— 把刚才减的加回去，返回 "已抢光"
     if (remain == null || remain < 0) {
         redisTemplate.opsForValue().increment(stockKey);
         throw BizException.conflict("优惠券已抢光");
     }
 
     // 注册事务回调：无论何种原因回滚，都恢复 Redis 库存 + 释放幂等键
+    // Redis 已经减了，但后面 DB 扣减可能失败、可能抛异常、可能事务回滚。如果回滚了，Redis 那 1 张要加回去
     TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
         @Override
         public void afterCompletion(int status) {
@@ -83,15 +93,23 @@ public boolean acquireCoupon(String userId, String couponCode) {
 后面再来请求，查 user_coupon 表就会拦住 ——"您已领取过该优惠券"；3.永久键会误伤正常请求，假设用户领过券了，过了一会儿又点进来看看 
 —— 如果 Redis 键是永久的，他会看到 "操作过于频繁"，但其实他是想查一下自己有没有领到，不是想再领一次。短窗口过期后，这个提示就不会再出现了。
 
-
-
-
 ### 回源建 Redis 库存
 
 ### 下单用券——applyToOrder
 
+校验+核销，返回这笔订单的抵扣额。
+
+```java
+
+```
+
 ### 退券——returnForOrder
 
+订单取消 / 超时 / 退款时，把它用过的那张券退回用户账户。
+
+```java
+
+```
 
 ## 库存对账——CouponStockReconcileScheduler
 
