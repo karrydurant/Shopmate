@@ -2,7 +2,7 @@
 
 Agent 记忆分为两层——短期记忆+长期记忆
 
-## 短期记忆——short_term
+## 短期记忆——ShortTermMemoryService
 
 会话级的工作记忆，只服务 "当前这轮对话"，存在 Redis 里，跟着会话 TTL 过期。
 
@@ -14,7 +14,7 @@ Agent 记忆分为两层——短期记忆+长期记忆
 
 3.返回对话历史时，拼接摘要 + 最近 N 轮
 
-### 写入——append_round
+### 写入——appendRound
 
 ```python
 def append_round(self, session_id: str, round_data: ChatRound):
