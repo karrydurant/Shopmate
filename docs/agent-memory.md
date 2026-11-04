@@ -16,98 +16,69 @@ Agent 记忆分为两层——短期记忆+长期记忆
 
 ### 写入——appendRound
 
-```python
-def append_round(self, session_id: str, round_data: ChatRound):
-    """追加一轮对话"""
-    key=SESSION_PREFIX + session_id
-    try:
-        self.client.rpush(key, json.dumps(round_data.to_dict(), ensure_ascii=False))
-        # 是否要压缩
-        self._maybe_trim(session_id, key)
-        # 给 key 续期
-        self.client.expire(key, settings.session_ttl_seconds)
-    except redis.RedisError as e:
-        logger.warning("[ShortTermMemory] Redis 不可用，本轮不落短期记忆 | session=%s | %s",
-                       session_id, e)
+```java
+public void appendRound(String sessionId, String role, String content) {
+    // 如果 sessionId 不存在或为 null 直接返回
+    if (sessionId == null || sessionId.isBlank()) return;
+    String key = SESSION_PREFIX + sessionId;
+    try {
+        // 用 map 存储一条消息，"role": role，"content": content
+        Map<String, Object> round = new LinkedHashMap<>();
+        round.put("role", role);
+        round.put("content", content == null ? "" : content);
+        // 右 push 到 Redis List
+        redis.opsForList().rightPush(key, JsonUtil.toJson(round));
+        // 是否要进行压缩
+        maybeTrim(sessionId, key);
+        // 刷新过期时间
+        redis.expire(key, Duration.ofSeconds(sessionTtlSeconds));
+    } catch (Exception e) {
+        log.warn("[ShortTerm] Redis不可用，本轮不落短期记忆 | session={} | {}", sessionId, e.getMessage());
+    }
+}
 ```
 
 ### 压缩
 
-#### _maybe_trim
+#### maybeTrim
 
-```python
-def _maybe_trim(self, session_id: str, key: str):
-    size = self.client.llen(key)
-    if not size or size <= settings.max_session_rounds:
-        return
-    
-    # 取出最旧的 round_to_compress 轮
-    round_to_compress = 5
-    old_rounds = []
-    for _ in range(round_to_compress):
-        raw = self.client.lpop(key)
-        if raw:
-            old_rounds.append(ChatRound.from_dict(json.loads(raw)))
-            
-    # 压缩最旧的 round_to_compress 轮
-    summary = self._compress_rounds(old_rounds)
-    
-    # 存入摘要
-    summary_key = SUMMARY_PREFIX + session_id
-    # 读取会话之前积累的摘要
-    existing = self.client.hget(summary_key, "summary") or ""
-    # 追加累积——而不是覆盖
-    merged = (existing + " " + summary).strip()
-    # _cap_summary 先过一遍 _cap_summary 防止 "摘要无限膨胀"
-    self.client.hset(summary_key, "summary", self._cap_summary(merged))
-    # 给摘要 key 续期，跟会话同生命周期
-    self.client.expire(summary_key, settings.session_ttl_seconds)
+```java
+private void maybeTrim(String sessionId, String key) {
+    Long size = redis.opsForList().size(key);
+    if (size == null || size <= maxSessionRounds) return;
 
-    logger.info("[ShortTermMemory] compressed %d rounds | session=%s | summary=%s",
-                round_to_compress, session_id, summary[:80])
+    List<Map<String, Object>> oldRounds = new ArrayList<>();
+    for (int i = 0; i < roundsToCompress; i++) {
+        String raw = redis.opsForList().leftPop(key);
+        if (raw == null) break;
+        try {
+            Map<String, Object> r = JSON.parseObject(raw, new TypeReference<Map<String, Object>>() {});
+            oldRounds.add(r);
+        } catch (Exception ignored) {
+        }
+    }
+    if (oldRounds.isEmpty()) return;
+
+    String summary = compressRounds(oldRounds);
+    appendSummary(sessionId, summary);
+    log.info("[ShortTerm] compressed {} rounds | session={}", oldRounds.size(), sessionId);
+}
 ```
 
 #### _cap_summary
 
 把摘要压到字符上限内
 
-```python
-def _cap_summary(self, summary: str) -> str:
-    limit = settings.memory_summary_max_chars
-    if len(summary) <= limit:
-        return summary
-    tail = summary[-limit:]
-    for sep in ("。", "；", "！", "？", "; ", ". "):
-        idx = tail.find(sep)
-        # 只在切掉的部分不超过三分之一时才归整到句边界
-        if 0 <= idx < limit // 3:
-            return tail[idx + len(sep):].strip()
-        return tail.strip()
+```java
+
 ```
 
-#### _compress_rounds
+#### compressRounds
 
 将多轮对话压缩成一句话摘要
 
-```python
-def _compress_rounds(self, rounds: List[ChatRound]) -> str:
-    if not rounds:
-        return ""
-    
-    # 构建对话片段
-    dialogue = "\n".join(
-        f"{'👤' if r.role == 'user' else '🤖'}: {r.content[:200]}"
-        for r in rounds if r.content
-    )
-    if not dialogue.strip():
-        return ""
+```java
 
-    # 优先 LLM 摘要
-    try:
-        return self._llm_summarize(dialogue)
-    except Exception as e:
-        logger.warning("[ShortTermMemory] LLM summary failed: %s → using keyword fallback", e)
-        return self._keyword_summarize(dialogue)
 ```
 
 ### 读取
