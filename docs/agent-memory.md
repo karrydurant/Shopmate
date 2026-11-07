@@ -161,6 +161,12 @@ def get_history(self, session_id: str) -> List[ChatRound]:
 
 2.召回——下一轮对话开头把相关记忆捞出来
 
+### LongTermMemoryService
+
+#### 写入——write
+
+
+
 ### 
 
 ## 设计细节
