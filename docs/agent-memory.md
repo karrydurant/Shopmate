@@ -20,6 +20,7 @@ Agent 记忆分为两层——短期记忆+长期记忆
 public void appendRound(String sessionId, String role, String content) {
     // 如果 sessionId 不存在或为 null 直接返回
     if (sessionId == null || sessionId.isBlank()) return;
+    // agent:session:{sessionId}
     String key = SESSION_PREFIX + sessionId;
     try {
         // 用 map 存储一条消息，"role": role，"content": content
@@ -27,6 +28,7 @@ public void appendRound(String sessionId, String role, String content) {
         round.put("role", role);
         round.put("content", content == null ? "" : content);
         // 右 push 到 Redis List
+        // 之所以要用到 key 是因为 Redis 中的存储都是 key-value 格式的
         redis.opsForList().rightPush(key, JsonUtil.toJson(round));
         // 是否要进行压缩
         maybeTrim(sessionId, key);
@@ -65,12 +67,26 @@ private void maybeTrim(String sessionId, String key) {
 }
 ```
 
-#### _cap_summary
+maxSessionRounds 是 20，roundsToCompress 是 5
+
+#### capSummary
 
 把摘要压到字符上限内
 
 ```java
-
+private String capSummary(String summary) {
+    if (summary.length() <= summaryMaxChars) return summary;
+    // 在摘要末尾截取 summaryMaxChars 长度
+    String tail=summary.substring(summary.length()-summaryMaxChars);
+    for (String sep : new String[]{"。", "；", "！", "？"}) {
+        int idx=tail.indexOf(sep);
+        // 如果第一个出现的标点在句子前面，就认为开头部分是一个被截断的句子，删掉
+        if (idx>=0 && idx<summaryMaxChars/3) {
+            return tail.substring(idx+sep.length()).strip();
+        }
+    }
+    return tail.strip();
+}
 ```
 
 #### compressRounds
@@ -78,7 +94,31 @@ private void maybeTrim(String sessionId, String key) {
 将多轮对话压缩成一句话摘要
 
 ```java
+private String compressRounds(List<Map<String, Object>> rounds) {
+    StringBuilder dialogue=new StringBuilder();
+    for (Map<String, Object> r : rounds) {
+        String role = String.valueOf(r.getOrDefault("role", ""));
+        String content = String.valueOf(r.getOrDefault("content", ""));
+        if (!content.isBlank()) {
+            String prefix = "user".equals(role) ? "👤: " : "🤖: ";
+            // 最多提取 200 字
+            dialogue.append(prefix).append(content, 0, Math.min(content.length(), 200)).append('\n');
+        }
+    }
+    String text = dialogue.toString().trim();
+    if (text.isEmpty()) return "";
 
+    // 优先 LLM 摘要
+    if (llmClient != null) {
+        try {
+            String llmSummary = llmSummarize(text);
+            if (llmSummary != null && !llmSummary.isBlank()) return llmSummary;
+        } catch (Exception e) {
+            log.warn("[ShortTerm] LLM summary failed → keyword fallback | {}", e.getMessage());
+        }
+    }
+    return keywordSummarize(text);
+}
 ```
 
 ### 读取
@@ -107,16 +147,8 @@ def get_history(self, session_id: str) -> List[ChatRound]:
 
 #### get_summary
 
-```python
-def get_summary(self, session_id: str) -> str:
-    """获取会话摘要。"""
-    try:
-        summary = self.client.hget(SUMMARY_PREFIX + session_id, "summary")
-    except redis.RedisError as e:
-        logger.warning("[ShortTermMemory] Redis 不可用，本轮无摘要 | session=%s | %s",
-                           session_id, e)
-        return ""
-    return summary if summary else ""
+```java
+
 ```
 
 ## 长期记忆
@@ -129,3 +161,20 @@ def get_summary(self, session_id: str) -> str:
 
 2.召回——下一轮对话开头把相关记忆捞出来
 
+### 
+
+## 设计细节
+
+### 为什么要做摘要？摘要保留什么？摘要又是怎么发挥作用的？
+
+随着对话轮次越来越多，每轮都把完整历史塞进 prompt 会导致：
+
+1.Token 成本爆炸
+
+2.上下文窗口撑爆
+
+3.注意力分散——历史太长，LLM 抓不住重点，容易 "忘了" 前面说的偏好
+
+摘要主要是保留早期用户对话中的偏好
+
+通过将摘要拼接进 prompt 发挥作用
